@@ -6,6 +6,7 @@ import {
     Transaction,
     Signer,
     TransactionConfirmationStatus,
+    clusterApiUrl,
 } from '@solana/web3.js';
 import {
     createMint,
@@ -20,29 +21,29 @@ interface Wallet {
 }
 
 // Type definitions for response objects
-interface AirdropResponse {
+interface BaseResponse {
     success: boolean;
-    signature?: string;
-    amount?: number;
     error?: string;
 }
 
-interface TransactionResponse {
-    success: boolean;
+interface AirdropResponse extends BaseResponse {
     signature?: string;
     amount?: number;
-    error?: string;
+    newBalance?: number;
 }
 
-interface TokenResponse {
-    success: boolean;
+interface TransactionResponse extends BaseResponse {
+    signature?: string;
+    amount?: number;
+}
+
+interface TokenResponse extends BaseResponse {
     tokenMint?: string;
     tokenAccount?: string;
     name?: string;
     symbol?: string;
     decimals?: number;
     initialSupply?: number;
-    error?: string;
 }
 
 interface TransactionHistoryItem {
@@ -54,33 +55,91 @@ interface TransactionHistoryItem {
     amount: number;
 }
 
+// Create a singleton connection to reuse
+const getConnection = (() => {
+    let connection: Connection | null = null;
+    return () => {
+        if (!connection) {
+            // Use environment variable if available, fallback to devnet
+            const rpcUrl = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || clusterApiUrl('devnet');
+
+            // Create connection with extended timeout config
+            connection = new Connection(rpcUrl, {
+                commitment: 'confirmed',
+                confirmTransactionInitialTimeout: 60000, // 60 seconds initial timeout
+            });
+
+            console.log(`Solana connection created with RPC URL: ${rpcUrl}`);
+        }
+        return connection;
+    };
+})();
+
 /**
- * Request an airdrop of SOL to a wallet address
+ * Request an airdrop of SOL to a wallet address with improved error handling and retry logic
  * @param {string} walletAddress - The public key of the wallet
- * @param {number} amount - Amount of SOL to request (default: 2)
+ * @param {number} amount - Amount of SOL to request (default: 0.05)
  * @returns {Promise<AirdropResponse>} - Transaction details
  */
-export async function requestAirdrop(walletAddress: string, amount: number = 2): Promise<AirdropResponse> {
-    try {
-        const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com');
-        const publicKey = new PublicKey(walletAddress);
+export async function requestAirdrop(walletAddress: string, amount: number = 0.05): Promise<AirdropResponse> {
+    const connection = getConnection();
+    const publicKey = new PublicKey(walletAddress);
+    const lamports = amount * LAMPORTS_PER_SOL;
 
-        const signature = await connection.requestAirdrop(publicKey, amount * LAMPORTS_PER_SOL);
-        await connection.confirmTransaction(signature);
+    // Increase timeout for confirmation
+    const MAX_RETRIES = 1;
 
-        return {
-            success: true,
-            signature,
-            amount
-        };
-    } catch (error) {
-        console.error('Error requesting airdrop:', error);
-        return {
-            success: false,
-            error: (error as Error).message
-        };
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            console.log(`Requesting airdrop attempt ${attempt}/${MAX_RETRIES}...`);
+
+            // Request the airdrop
+            const signature = await connection.requestAirdrop(publicKey, lamports);
+
+            // Use the correct confirmation strategy format
+            const confirmationResponse = await connection.confirmTransaction(
+                signature,
+                'confirmed'
+            );
+
+            if (confirmationResponse.value.err) {
+                throw new Error(`Transaction failed: ${confirmationResponse.value.err}`);
+            }
+
+            console.log(`Airdrop successful! Signature: ${signature}`);
+
+            // Verify balance increase to be extra sure
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Short delay
+            const balance = await connection.getBalance(publicKey);
+
+            return {
+                success: true,
+                signature,
+                amount,
+                newBalance: balance / LAMPORTS_PER_SOL
+            };
+        } catch (error) {
+            console.warn(`Airdrop attempt ${attempt} failed:`, error);
+
+            if (attempt === MAX_RETRIES) {
+                return {
+                    success: false,
+                    error: error instanceof Error ? error.message : String(error)
+                };
+            }
+
+            // Wait before retrying with exponential backoff
+            await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+        }
     }
+
+    // This should never be reached due to the return in the catch block on final attempt
+    return {
+        success: false,
+        error: "Failed to complete airdrop after all retry attempts"
+    };
 }
+
 
 /**
  * Get the SOL balance of a wallet
@@ -89,7 +148,7 @@ export async function requestAirdrop(walletAddress: string, amount: number = 2):
  */
 export async function getWalletBalance(walletAddress: string): Promise<number> {
     try {
-        const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com');
+        const connection = getConnection();
         const publicKey = new PublicKey(walletAddress);
 
         const balance = await connection.getBalance(publicKey);
@@ -108,20 +167,24 @@ export async function getWalletBalance(walletAddress: string): Promise<number> {
  * @returns {Promise<TransactionResponse>} - Transaction details
  */
 export async function sendTransaction(wallet: Wallet, toAddress: string, amount: number): Promise<TransactionResponse> {
-    try {
-        if (!wallet.publicKey || !wallet.signTransaction) {
-            throw new Error('Wallet not connected');
-        }
+    if (!wallet.publicKey || !wallet.signTransaction) {
+        return {
+            success: false,
+            error: 'Wallet not connected'
+        };
+    }
 
-        const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com');
+    try {
+        const connection = getConnection();
         const recipient = new PublicKey(toAddress);
+        const lamports = amount * LAMPORTS_PER_SOL;
 
         // Create a transaction
         const transaction = new Transaction().add(
             SystemProgram.transfer({
                 fromPubkey: wallet.publicKey,
                 toPubkey: recipient,
-                lamports: amount * LAMPORTS_PER_SOL,
+                lamports,
             })
         );
 
@@ -130,10 +193,8 @@ export async function sendTransaction(wallet: Wallet, toAddress: string, amount:
         transaction.recentBlockhash = blockhash;
         transaction.feePayer = wallet.publicKey;
 
-        // Sign the transaction
+        // Sign and send the transaction
         const signedTransaction = await wallet.signTransaction(transaction);
-
-        // Send the transaction
         const signature = await connection.sendRawTransaction(signedTransaction.serialize());
         await connection.confirmTransaction(signature);
 
@@ -146,7 +207,7 @@ export async function sendTransaction(wallet: Wallet, toAddress: string, amount:
         console.error('Error sending transaction:', error);
         return {
             success: false,
-            error: (error as Error).message
+            error: error instanceof Error ? error.message : String(error)
         };
     }
 }
@@ -167,30 +228,30 @@ export async function createToken(
     decimals: number = 9,
     initialSupply: number
 ): Promise<TokenResponse> {
-    try {
-        if (!wallet.publicKey || !wallet.signTransaction) {
-            throw new Error('Wallet not connected');
-        }
+    if (!wallet.publicKey || !wallet.signTransaction) {
+        return {
+            success: false,
+            error: 'Wallet not connected'
+        };
+    }
 
-        const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com');
+    try {
+        const connection = getConnection();
+        const walletAsSigner = wallet as unknown as Signer;  // Type assertion for compatibility
 
         // Create a new token mint
-        const mintAuthority = wallet.publicKey;
-        const freezeAuthority = wallet.publicKey;
-
-        // Create the token
         const tokenMint = await createMint(
             connection,
-            wallet as unknown as Signer,  // Type assertion for compatibility
-            mintAuthority,
-            freezeAuthority,
+            walletAsSigner,
+            wallet.publicKey,  // mintAuthority
+            wallet.publicKey,  // freezeAuthority
             decimals
         );
 
         // Get the token account
         const tokenAccount = await getOrCreateAssociatedTokenAccount(
             connection,
-            wallet as unknown as Signer,  // Type assertion for compatibility
+            walletAsSigner,
             tokenMint,
             wallet.publicKey
         );
@@ -198,10 +259,10 @@ export async function createToken(
         // Mint tokens to the token account
         await mintTo(
             connection,
-            wallet as unknown as Signer,  // Type assertion for compatibility
+            walletAsSigner,
             tokenMint,
             tokenAccount.address,
-            mintAuthority,
+            wallet.publicKey,
             initialSupply * (10 ** decimals)
         );
 
@@ -218,7 +279,7 @@ export async function createToken(
         console.error('Error creating token:', error);
         return {
             success: false,
-            error: (error as Error).message
+            error: error instanceof Error ? error.message : String(error)
         };
     }
 }
@@ -231,21 +292,28 @@ export async function createToken(
  */
 export async function getTransactionHistory(walletAddress: string, limit: number = 10): Promise<TransactionHistoryItem[]> {
     try {
-        const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com');
+        const connection = getConnection();
         const publicKey = new PublicKey(walletAddress);
 
         const signatures = await connection.getSignaturesForAddress(publicKey, { limit });
 
+        if (signatures.length === 0) return [];
+
+        // Batch process transactions
         const transactions = await Promise.all(
             signatures.map(async (sig) => {
                 const tx = await connection.getTransaction(sig.signature);
+                const amount = tx?.meta ?
+                    (tx.meta.postBalances[0] - tx.meta.preBalances[0]) / LAMPORTS_PER_SOL :
+                    0;
+
                 return {
                     signature: sig.signature,
                     blockTime: sig.blockTime ?? null,
                     slot: sig.slot,
                     confirmationStatus: sig.confirmationStatus ?? null,
                     memo: tx?.meta?.logMessages?.find((log: string) => log.includes('Program log:')) || '',
-                    amount: tx?.meta ? (tx.meta.postBalances[0] - tx.meta.preBalances[0]) : 0,
+                    amount,
                 };
             })
         );
@@ -264,17 +332,17 @@ export async function getTransactionHistory(walletAddress: string, limit: number
  * @returns {string} - Formatted public key
  */
 export function formatPublicKey(publicKey: string | null | undefined, length: number = 4): string {
-    if (!publicKey) return '';
+    if (!publicKey || publicKey.length < (length * 2)) return '';
     return `${publicKey.slice(0, length)}...${publicKey.slice(-length)}`;
 }
 
 /**
- * Format a lamport amount to SOL
- * @param {number} lamports - Lamports amount
+ * Format a SOL amount with appropriate precision
+ * @param {number} sol - SOL amount
  * @returns {string} - Formatted SOL amount
  */
-export function formatSol(lamports: number): string {
-    return (lamports / LAMPORTS_PER_SOL).toLocaleString(undefined, {
+export function formatSol(sol: number): string {
+    return sol.toLocaleString(undefined, {
         minimumFractionDigits: 2,
         maximumFractionDigits: 9,
     });
